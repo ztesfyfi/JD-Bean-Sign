@@ -376,10 +376,10 @@ async def qr_login_status(session_id: str):
         payload = json.loads(match.group(1) if match else response.text)
         code = payload.get("code")
         if code == 201:
+            return {"status": "waiting", "message": "等待扫码"}
+        if code == 202:
             session["last_message"] = "已扫码，请在京东 App 确认登录"
             return {"status": "scanned", "message": session["last_message"]}
-        if code == 202:
-            return {"status": "waiting", "message": "等待扫码"}
         if code == 203:
             session["status"] = "expired"
             session["last_message"] = "二维码已失效，请刷新"
