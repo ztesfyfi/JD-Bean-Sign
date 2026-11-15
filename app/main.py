@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
+import random
 import re
+import secrets
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, date
 from pathlib import Path
@@ -22,7 +26,10 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "jd-bean-sign.db"
 KEY_PATH = DATA_DIR / "secret.key"
-SIGN_TIME = os.getenv("SIGN_TIME", "08:05")
+DEFAULT_START = os.getenv("SIGN_START", "07:00")
+DEFAULT_END = os.getenv("SIGN_END", "10:00")
+QR_TTL_SECONDS = 180
+QR_SESSIONS: dict[str, dict[str, Any]] = {}
 
 
 def get_cipher() -> Fernet:
@@ -69,7 +76,30 @@ def init_db() -> None:
             message TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS daily_schedule (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            schedule_date TEXT NOT NULL,
+            scheduled_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            UNIQUE(account_id, schedule_date)
+        );
         """)
+        conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('window_start',?)", (DEFAULT_START,))
+        conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('window_end',?)", (DEFAULT_END,))
+
+
+def get_setting(key: str, default: str) -> str:
+    with db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with db() as conn:
+        conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
 
 def now_text() -> str:
@@ -241,11 +271,11 @@ def save_record(account_id: int, label: str, result: SignResult) -> None:
         )
 
 
-async def sign_account(account_id: int) -> None:
+async def sign_account(account_id: int) -> SignResult | None:
     with db() as conn:
         row = conn.execute("SELECT * FROM accounts WHERE id=? AND enabled=1", (account_id,)).fetchone()
     if not row:
-        return
+        return None
     try:
         cookie = decrypt_cookie(row["cookie_enc"])
         valid, message = await check_cookie(cookie)
@@ -253,6 +283,7 @@ async def sign_account(account_id: int) -> None:
     except Exception as exc:
         result = SignResult("error", message=str(exc))
     save_record(account_id, row["label"], result)
+    return result
 
 
 async def sign_all() -> None:
@@ -262,20 +293,91 @@ async def sign_all() -> None:
         await sign_account(account_id)
 
 
-def scheduled_sign() -> None:
+def _minutes(value: str) -> int:
+    try:
+        hour, minute = (int(part) for part in value.split(":", 1))
+    except (ValueError, TypeError):
+        raise ValueError("时间格式必须为 HH:MM")
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("时间必须在 00:00–23:59 之间")
+    return hour * 60 + minute
+
+
+def ensure_daily_plan() -> None:
+    today = date.today().isoformat()
+    with db() as conn:
+        exists = conn.execute("SELECT 1 FROM daily_schedule WHERE schedule_date=? LIMIT 1", (today,)).fetchone()
+        if exists:
+            return
+        accounts = conn.execute("SELECT id FROM accounts WHERE enabled=1 ORDER BY id").fetchall()
+        if not accounts:
+            return
+        start = _minutes(get_setting("window_start", DEFAULT_START))
+        end = _minutes(get_setting("window_end", DEFAULT_END))
+        if end <= start:
+            return
+        ids = [row["id"] for row in accounts]
+        random.shuffle(ids)
+        gaps = [random.randint(3, 15) for _ in range(max(0, len(ids) - 1))]
+        available = (end - start) * 60
+        total = sum(gaps) * 60
+        if total > available and total:
+            gaps = [max(1, int(gap * available / total)) for gap in gaps]
+        used = sum(gaps) * 60
+        offset = random.randint(0, max(0, available - used)) if ids else 0
+        cursor = start * 60 + offset
+        now = datetime.now().astimezone()
+        for index, account_id in enumerate(ids):
+            run_at = now.replace(hour=cursor // 3600, minute=(cursor % 3600) // 60, second=0, microsecond=0)
+            if run_at < now:
+                run_at = now
+            conn.execute(
+                "INSERT OR IGNORE INTO daily_schedule(account_id,schedule_date,scheduled_at) VALUES(?,?,?)",
+                (account_id, today, run_at.isoformat(timespec="seconds")),
+            )
+            if index < len(gaps):
+                cursor += gaps[index] * 60
+
+
+async def process_due_signs() -> None:
+    ensure_daily_plan()
+    now = datetime.now().astimezone()
+    with db() as conn:
+        due = conn.execute(
+            "SELECT * FROM daily_schedule WHERE schedule_date=? AND status='pending' AND scheduled_at<=? ORDER BY scheduled_at",
+            (date.today().isoformat(), now.isoformat(timespec="seconds")),
+        ).fetchall()
+        ids = [row["id"] for row in due]
+        for schedule_id in ids:
+            conn.execute("UPDATE daily_schedule SET status='running', attempts=attempts+1 WHERE id=?", (schedule_id,))
+    for schedule_id in ids:
+        with db() as conn:
+            item = conn.execute("SELECT * FROM daily_schedule WHERE id=?", (schedule_id,)).fetchone()
+        result = await sign_account(item["account_id"])
+        if result and result.status in ("error", "cookie_invalid") and item["attempts"] + 1 < 3:
+            from datetime import timedelta
+            retry_at = datetime.now().astimezone() + timedelta(minutes=random.randint(10, 20))
+            with db() as conn:
+                conn.execute("UPDATE daily_schedule SET status='pending', scheduled_at=? WHERE id=?",
+                             (retry_at.isoformat(timespec="seconds"), schedule_id))
+        else:
+            with db() as conn:
+                conn.execute("UPDATE daily_schedule SET status='done' WHERE id=?", (schedule_id,))
+
+
+def scheduled_tick() -> None:
     import asyncio
-    asyncio.run(sign_all())
+    try:
+        asyncio.run(process_due_signs())
+    except Exception:
+        return
 
 
 init_db()
 scheduler = BackgroundScheduler(timezone=os.getenv("TZ", "Asia/Shanghai"))
-try:
-    hour, minute = [int(x) for x in SIGN_TIME.split(":", 1)]
-    if 0 <= hour <= 23 and 0 <= minute <= 59:
-        scheduler.add_job(scheduled_sign, "cron", hour=hour, minute=minute, id="daily-sign", replace_existing=True)
-except ValueError:
-    pass
+scheduler.add_job(scheduled_tick, "interval", seconds=30, id="random-daily-sign", replace_existing=True, max_instances=1)
 scheduler.start()
+
 
 app = FastAPI(title="JD Bean Sign", version="0.1.0")
 templates = Jinja2Templates(directory="web")
@@ -295,7 +397,8 @@ async def home(request: Request):
     return templates.TemplateResponse("index.html", {
         "request": request, "accounts": accounts, "records": records,
         "today_count": totals["count"], "today_beans": totals["beans"], "all_beans": all_beans,
-        "sign_time": SIGN_TIME,
+        "window_start": get_setting("window_start", DEFAULT_START),
+        "window_end": get_setting("window_end", DEFAULT_END),
     })
 
 
@@ -521,6 +624,29 @@ async def account_sign(account_id: int):
 async def sign_everyone():
     await sign_all()
     return {"ok": True}
+
+
+@app.get("/api/settings/sign-time")
+async def get_sign_time_settings():
+    return {"start": get_setting("window_start", DEFAULT_START),
+            "end": get_setting("window_end", DEFAULT_END)}
+
+
+@app.post("/api/settings/sign-time")
+async def update_sign_time_settings(payload: dict):
+    start = str(payload.get("start", ""))
+    end = str(payload.get("end", ""))
+    try:
+        if _minutes(end) <= _minutes(start):
+            raise ValueError("结束时间必须晚于开始时间，且不能跨午夜")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    set_setting("window_start", start)
+    set_setting("window_end", end)
+    with db() as conn:
+        conn.execute("DELETE FROM daily_schedule WHERE schedule_date=? AND status='pending'", (date.today().isoformat(),))
+    ensure_daily_plan()
+    return {"ok": True, "start": start, "end": end}
 
 
 @app.get("/health")
