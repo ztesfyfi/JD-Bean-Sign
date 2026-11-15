@@ -312,8 +312,10 @@ def ensure_daily_plan() -> None:
             return
         start = _minutes(get_setting("window_start", DEFAULT_START))
         end = _minutes(get_setting("window_end", DEFAULT_END))
-        if end <= start:
+        current = datetime.now().astimezone()
+        if end <= start or current.hour * 60 + current.minute >= end:
             return
+        start = max(start, current.hour * 60 + current.minute)
         ids = [row["id"] for row in accounts if row["id"] not in existing]
         random.shuffle(ids)
         gaps = [random.randint(3, 15) for _ in range(max(0, len(ids) - 1))]
