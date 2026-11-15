@@ -101,55 +101,136 @@ class SignResult:
 
 
 async def check_cookie(cookie: str) -> tuple[bool, str]:
-    """只检查登录态，不触发签到。"""
+    """校验京东登录态，不触发签到。"""
     try:
-        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             response = await client.get(
                 "https://me-api.jd.com/user_new/info/GetJDUserInfoUnion",
-                headers={"Cookie": cookie, "User-Agent": "Mozilla/5.0", "Referer": "https://home.m.jd.com/"},
+                headers={
+                    "Cookie": cookie,
+                    "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36",
+                    "Referer": "https://m.jd.com/",
+                },
             )
         data = response.json()
-        if data.get("retcode") == "0" and data.get("data"):
-            return True, "Cookie 有效"
-        return False, "京东未返回有效登录信息，Cookie 可能已失效"
+        return (isinstance(data, dict) and str(data.get("retcode")) in ("0", "200"),
+                "Cookie 有效" if isinstance(data, dict) and str(data.get("retcode")) in ("0", "200")
+                else "京东登录态校验失败，请更新 Cookie")
+    except httpx.TimeoutException:
+        return False, "Cookie 检测超时"
     except Exception as exc:
-        return False, f"检测接口异常：{type(exc).__name__}"
+        return False, f"Cookie 检测接口异常：{type(exc).__name__}"
+
+
+def _jd_client_action(client: httpx.AsyncClient, cookie: str, function_id: str) -> str:
+    params = {
+        "functionId": function_id, "appid": "ld", "client": "android",
+        "clientVersion": "10.6.8", "networkType": "wifi",
+        "osVersion": "13", "uuid": "jd-bean-sign",
+    }
+    body = {
+        "fp": "-1", "shshshfp": "-1", "shshshfpa": "-1",
+        "referUrl": "-1", "userAgent": "-1", "jda": "-1", "rnVersion": "3.9",
+    }
+    response = client.post(
+        "https://api.m.jd.com/client.action",
+        params=params,
+        data={"body": json.dumps(body, separators=(",", ":"))},
+        headers={
+            "Cookie": cookie,
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/126.0.0.0 Mobile Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": "https://m.jd.com/",
+        },
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def _parse_jd_claim(raw: str) -> dict[str, Any]:
+    result = {"status": "unknown", "beans": 0, "message": ""}
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        result["message"] = (raw or "")[:200]
+        return result
+    if not isinstance(data, dict):
+        result["message"] = "京东接口返回格式无法识别"
+        return result
+    code = str(data.get("code", ""))
+    message = str(data.get("message") or data.get("msg") or data.get("errMsg") or "").strip()
+    payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+    result["message"] = message or json.dumps(data, ensure_ascii=False)[:200]
+    if code in ("0", "200"):
+        if "已签" in message or any(payload.get(k) in (True, 1, "1", "true")
+                                     for k in ("isSign", "signed", "todaySigned")):
+            result["status"] = "already"
+            return result
+        for key in ("beanCount", "beans", "reward"):
+            value = payload.get(key)
+            if value is not None and str(value).isdigit():
+                result["beans"] = int(value)
+                break
+        award = payload.get("dailyAward") or payload.get("beanAward")
+        if isinstance(award, dict):
+            value = award.get("beanAward") or award.get("beanCount")
+            if value is not None and str(value).isdigit():
+                result["beans"] = int(value)
+        result["status"] = "success"
+        return result
+    if any(word in message for word in ("人数较多", "稍晚", "繁忙", "系统繁忙", "稍后再试")):
+        result["status"] = "busy"
+    elif any(word.lower() in message.lower() for word in ("登录", "未登录", "cookie", "失效", "过期", "鉴权", "token")):
+        result["status"] = "cookie_invalid"
+    else:
+        result["status"] = "rejected"
+    return result
 
 
 async def perform_sign(cookie: str) -> SignResult:
-    """
-    临时签到适配器。京东签到接口会变化，只有可识别的业务成功响应才应记成功。
-    未知响应明确记为接口异常，绝不把 HTTP 200 直接当作签到成功。
-    """
-    url = "https://api.m.jd.com/client.action"
-    params = {"functionId": "signBeanAct", "appid": "ld"}
-    headers = {
-        "Cookie": cookie,
-        "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36",
-        "Referer": "https://bean.m.jd.com/",
-        "Origin": "https://bean.m.jd.com",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
+    """先查今日签到状态，再领取京豆；只按京东业务响应判断结果。"""
     try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            response = await client.post(url, params=params, data={"body": json.dumps({})}, headers=headers)
-        if response.status_code in (401, 403):
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            index = _parse_jd_claim(_jd_client_action(client, cookie, "signBeanIndex"))
+            if index["status"] == "already":
+                return SignResult("already", message="今日已签到")
+            if index["status"] == "cookie_invalid":
+                return SignResult("cookie_invalid", message="签到状态查询被拒绝，请更新 Cookie")
+            last = None
+            for attempt in range(1, 4):
+                try:
+                    parsed = _parse_jd_claim(_jd_client_action(client, cookie, "signBean"))
+                except httpx.TimeoutException:
+                    last = SignResult("error", message=f"领取京豆超时（第 {attempt}/3 次）")
+                    if attempt < 3:
+                        await __import__("asyncio").sleep(2)
+                        continue
+                    return last
+                status = parsed["status"]
+                if status == "success":
+                    return SignResult("success", int(parsed["beans"] or 0),
+                                      parsed["message"] or "京东返回领取成功")
+                if status == "already":
+                    return SignResult("already", message="今日已签到")
+                if status == "busy":
+                    return SignResult("error", message=f"京东服务繁忙：{parsed['message']}")
+                if status in ("cookie_invalid", "rejected"):
+                    return SignResult("cookie_invalid" if status == "cookie_invalid" else "error",
+                                      message=parsed["message"] or "京东拒绝本次签到")
+                last = SignResult("error", message=f"京东响应无法识别：{parsed['message'][:160]}")
+                if attempt < 3:
+                    await __import__("asyncio").sleep(2)
+            return last or SignResult("error", message="签到失败")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (401, 403):
             return SignResult("cookie_invalid", message="京东拒绝请求，Cookie 可能已失效")
-        try:
-            payload: Any = response.json()
-        except ValueError:
-            return SignResult("error", message=f"签到接口返回非 JSON（HTTP {response.status_code}）")
-        if not isinstance(payload, dict):
-            return SignResult("error", message="签到接口返回格式无法识别")
-        text = json.dumps(payload, ensure_ascii=False)
-        lower = text.lower()
-        if any(k in lower for k in ("已签到", "今天已签到", "今日已签到", "already signed")):
-            return SignResult("already", message="京东接口提示今日已签到")
-        return SignResult("error", message=f"签到接口业务响应未识别：{text[:240]}")
+        return SignResult("error", message=f"京东接口 HTTP {exc.response.status_code}")
     except httpx.TimeoutException:
-        return SignResult("error", message="签到请求超时")
+        return SignResult("error", message="京东签到接口请求超时")
     except Exception as exc:
-        return SignResult("error", message=f"签到请求异常：{type(exc).__name__}")
+        return SignResult("error", message=f"京东签到接口异常：{type(exc).__name__}")
+
 
 
 def save_record(account_id: int, label: str, result: SignResult) -> None:
