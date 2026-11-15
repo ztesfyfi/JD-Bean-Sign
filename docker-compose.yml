@@ -8,6 +8,7 @@ services:
     environment:
       TZ: Asia/Shanghai
       DATA_DIR: /data
-      SIGN_TIME: "08:05"
+      SIGN_START: "07:00"
+      SIGN_END: "10:00"
     volumes:
       - ./data:/data
