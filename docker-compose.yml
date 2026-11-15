@@ -1,0 +1,13 @@
+services:
+  jd-bean-sign:
+    build: .
+    container_name: jd-bean-sign
+    restart: unless-stopped
+    ports:
+      - "8080:8000"
+    environment:
+      TZ: Asia/Shanghai
+      DATA_DIR: /data
+      SIGN_TIME: "08:05"
+    volumes:
+      - ./data:/data
