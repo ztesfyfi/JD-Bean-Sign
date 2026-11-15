@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>JD Bean Sign · 京豆签到</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#151d31;--muted:#8c9ab5;--line:#26324b;--red:#e83d4d;--green:#32c48d}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(140deg,#101a31,#0b1020 55%);color:#edf2ff;font:15px system-ui,-apple-system,"Microsoft YaHei",sans-serif}
+main{max-width:1120px;margin:auto;padding:32px 20px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}h1{margin:0;font-size:26px}.sub{color:var(--muted);margin-top:6px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:26px 0}
+.card,.section{background:rgba(21,29,49,.94);border:1px solid var(--line);border-radius:16px;padding:20px}.metric{font-size:30px;font-weight:750;margin-top:8px}.muted{color:var(--muted);font-size:13px}
+.section{margin:16px 0}.section h2{font-size:17px;margin:0 0 16px}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+input,textarea{background:#0c1427;color:#fff;border:1px solid #33415f;border-radius:9px;padding:11px;font:inherit;min-width:0}input{flex:1}textarea{width:100%;min-height:90px;resize:vertical}
+button{border:0;border-radius:9px;padding:10px 15px;background:var(--red);color:#fff;font-weight:650;cursor:pointer}button.secondary{background:#293650}button.danger{background:#5b2632}
+.account{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:13px 0;border-top:1px solid var(--line);flex-wrap:wrap}.pill{border-radius:99px;padding:4px 9px;background:#263650;font-size:12px}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:11px 8px;border-top:1px solid var(--line)}th{color:var(--muted);font-weight:500}
+@media(max-width:650px){main{padding:22px 14px}.grid{grid-template-columns:1fr}.metric{font-size:25px}table{display:block;overflow:auto;white-space:nowrap}}
+</style></head><body><main>
+<div class="top"><div><h1>🫘 JD Bean Sign</h1><div class="sub">京东每日签到 · 只做签到领京豆</div></div><button onclick="signAll()">立即签到全部账号</button></div>
+<div class="grid"><div class="card"><div class="muted">今日成功签到账号</div><div class="metric">{{ today_count }}</div></div><div class="card"><div class="muted">今日获得京豆</div><div class="metric">{{ today_beans }}</div></div><div class="card"><div class="muted">累计记录京豆</div><div class="metric">{{ all_beans }}</div></div></div>
+<section class="section"><h2>添加京东账号</h2><div class="row"><input id="label" placeholder="账号备注，例如：主账号"></div><p><textarea id="cookie" placeholder="粘贴完整 Cookie（必须包含 pt_pin 和 pt_key）"></textarea></p><div class="row"><button onclick="addAccount()">保存账号</button><span class="muted">Cookie 使用本地密钥加密保存，不会在页面回显</span></div></section>
+<section class="section"><h2>账号管理 <span class="pill">{{ accounts|length }} 个</span></h2>
+{% if accounts %}{% for a in accounts %}<div class="account"><div><strong>{{ a.label }}</strong><div class="muted">pt_pin：{{ a.pin[:3] }}*** · {{ '已启用' if a.enabled else '已停用' }}</div></div><div class="row"><button class="secondary" onclick="checkAccount({{a.id}})">检测 Cookie</button><button class="secondary" onclick="signOne({{a.id}})">签到</button><button class="secondary" onclick="toggleAccount({{a.id}})">启停</button><button class="danger" onclick="deleteAccount({{a.id}})">删除</button></div></div>{% endfor %}{% else %}<p class="muted">还没有账号，添加 Cookie 后即可管理。</p>{% endif %}</section>
+<section class="section"><h2>最近签到记录</h2><table><thead><tr><th>时间</th><th>账号</th><th>状态</th><th>京豆</th><th>说明</th></tr></thead><tbody>
+{% for r in records %}<tr><td>{{r.created_at}}</td><td>{{r.label}}</td><td>{{ {'success':'成功','already':'今日已签到','cookie_invalid':'Cookie失效','error':'接口异常'}.get(r.status,r.status) }}</td><td>{{r.beans}}</td><td>{{r.message}}</td></tr>{% else %}<tr><td colspan="5" class="muted">暂无记录</td></tr>{% endfor %}</tbody></table></section>
+<p class="muted">自动签到时间：{{ sign_time }}（容器时区） · 当前版本尚未加入登录认证，请勿将管理端口直接暴露到公网。</p></main>
+<script>
+async function api(url,method='POST',body){const r=await fetch(url,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.detail||'请求失败');return d}
+async function run(fn){try{await fn();location.reload()}catch(e){alert(e.message)}}
+function addAccount(){return run(async()=>{await api('/api/accounts','POST',{label:document.querySelector('#label').value,cookie:document.querySelector('#cookie').value});alert('账号已保存')})}
+function checkAccount(id){return run(async()=>{const d=await api('/api/accounts/'+id+'/check');alert(d.message)})}
+function signOne(id){return run(async()=>{const d=await api('/api/accounts/'+id+'/sign');alert(d.message||'已执行')})}
+function signAll(){return run(async()=>{await api('/api/sign-all');alert('已执行全部账号签到')})}
+function toggleAccount(id){return run(()=>api('/api/accounts/'+id+'/toggle'))}
+function deleteAccount(id){if(confirm('确定删除该账号及其 Cookie？'))return run(()=>api('/api/accounts/'+id,'DELETE'))}
+</script></body></html>
