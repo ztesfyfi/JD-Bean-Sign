@@ -299,6 +299,171 @@ async def home(request: Request):
     })
 
 
+
+def _qr_cleanup() -> None:
+    cutoff = time.time() - QR_TTL_SECONDS
+    for key, value in list(QR_SESSIONS.items()):
+        if value.get("created", 0) < cutoff or value.get("status") in ("success", "expired", "cancelled", "error"):
+            client = value.get("client")
+            if client is not None:
+                # close is scheduled by the route that completes/cancels; stale sessions are dropped here
+                pass
+            QR_SESSIONS.pop(key, None)
+
+
+@app.post("/api/accounts/qr-login/init")
+async def qr_login_init():
+    _qr_cleanup()
+    client = httpx.AsyncClient(timeout=15, follow_redirects=True)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+        "Referer": "https://passport.jd.com/new/login.aspx",
+    }
+    try:
+        await client.get("https://passport.jd.com/new/login.aspx", headers=headers)
+        response = await client.get(
+            "https://qr.m.jd.com/show",
+            params={"appid": "133", "size": "300", "t": str(int(time.time() * 1000))},
+            headers=headers,
+        )
+        response.raise_for_status()
+        if not response.headers.get("content-type", "").startswith("image/"):
+            raise RuntimeError("京东没有返回二维码图片")
+        token = client.cookies.get("wlfstk_smdl")
+        if not token:
+            raise RuntimeError("未能取得二维码校验令牌，请稍后重试")
+        session_id = secrets.token_urlsafe(24)
+        QR_SESSIONS[session_id] = {
+            "client": client, "token": token, "created": time.time(),
+            "status": "waiting", "headers": headers, "last_message": "等待京东 App 扫码",
+        }
+        return {
+            "session_id": session_id,
+            "qr_image": "data:image/png;base64," + base64.b64encode(response.content).decode(),
+            "expires_in": QR_TTL_SECONDS,
+        }
+    except Exception as exc:
+        await client.aclose()
+        raise HTTPException(502, f"获取京东二维码失败：{type(exc).__name__}：{str(exc)[:120]}")
+
+
+@app.get("/api/accounts/qr-login/status")
+async def qr_login_status(session_id: str):
+    session = QR_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(404, "二维码登录会话不存在或已过期，请重新获取")
+    if time.time() - session["created"] > QR_TTL_SECONDS:
+        await session["client"].aclose()
+        QR_SESSIONS.pop(session_id, None)
+        return {"status": "expired", "message": "二维码已过期，请刷新"}
+    if session["status"] != "waiting":
+        return {"status": session["status"], "message": session.get("last_message", "")}
+
+    client: httpx.AsyncClient = session["client"]
+    headers = session["headers"]
+    try:
+        response = await client.get(
+            "https://qr.m.jd.com/check",
+            params={
+                "appid": "133",
+                "callback": "jQuery" + str(secrets.randbelow(9000000) + 1000000),
+                "token": session["token"],
+                "_": str(int(time.time() * 1000)),
+            },
+            headers=headers,
+        )
+        match = re.search(r"\((.*)\)\s*;?\s*$", response.text, re.S)
+        payload = json.loads(match.group(1) if match else response.text)
+        code = payload.get("code")
+        if code == 201:
+            session["last_message"] = "已扫码，请在京东 App 确认登录"
+            return {"status": "scanned", "message": session["last_message"]}
+        if code == 202:
+            return {"status": "waiting", "message": "等待扫码"}
+        if code == 203:
+            session["status"] = "expired"
+            session["last_message"] = "二维码已失效，请刷新"
+            await client.aclose()
+            return {"status": "expired", "message": session["last_message"]}
+        if code != 200:
+            return {"status": "waiting", "message": payload.get("msg", "等待扫码")}
+
+        ticket = payload.get("ticket")
+        if not ticket:
+            raise RuntimeError("京东扫码确认响应缺少 ticket")
+        validation = await client.get(
+            "https://passport.jd.com/uc/qrCodeTicketValidation",
+            params={"t": ticket},
+            headers={**headers, "Referer": "https://passport.jd.com/uc/login?ltype=logout"},
+        )
+        validation.raise_for_status()
+        try:
+            validation_data = validation.json()
+        except ValueError:
+            validation_data = json.loads(validation.text)
+        if validation_data.get("returnCode") != 0:
+            session["last_message"] = "扫码票据校验未通过，请重新扫码"
+            session["status"] = "error"
+            await client.aclose()
+            return {"status": "error", "message": session["last_message"]}
+
+        # Collect cookies after ticket validation; do not trust the QR scan state alone.
+        cookie_pairs = {}
+        for cookie in client.cookies.jar:
+            if cookie.name in ("pt_key", "pt_pin"):
+                cookie_pairs[cookie.name] = cookie.value
+        if not cookie_pairs.get("pt_key") or not cookie_pairs.get("pt_pin"):
+            session["status"] = "error"
+            session["last_message"] = "京东已确认扫码，但未取得完整 pt_key/pt_pin。请重试或使用手动 Cookie 导入"
+            await client.aclose()
+            return {"status": "error", "message": session["last_message"]}
+
+        cookie_text = f"pt_key={cookie_pairs['pt_key']}; pt_pin={cookie_pairs['pt_pin']};"
+        pin = unquote(cookie_pairs["pt_pin"])
+        valid, message = await check_cookie(cookie_text)
+        if not valid:
+            session["status"] = "error"
+            session["last_message"] = "登录态校验失败：" + message
+            await client.aclose()
+            return {"status": "error", "message": session["last_message"]}
+
+        with db() as conn:
+            existing = conn.execute("SELECT id FROM accounts WHERE pin=?", (pin,)).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE accounts SET cookie_enc=?, enabled=1 WHERE id=?",
+                    (cipher.encrypt(cookie_text.encode()).decode(), existing["id"]),
+                )
+                account_id = existing["id"]
+                action = "已更新现有账号 Cookie"
+            else:
+                cur = conn.execute(
+                    "INSERT INTO accounts(label,pin,cookie_enc,enabled,created_at) VALUES(?,?,?,?,?)",
+                    (pin, pin, cipher.encrypt(cookie_text.encode()).decode(), 1, now_text()),
+                )
+                account_id = cur.lastrowid
+                action = "已添加新账号"
+        session["status"] = "success"
+        session["last_message"] = action
+        await client.aclose()
+        return {"status": "success", "message": action, "account_id": account_id, "pin_masked": pin[:2] + "***"}
+    except Exception as exc:
+        session["status"] = "error"
+        session["last_message"] = f"扫码登录异常：{type(exc).__name__}"
+        await client.aclose()
+        return {"status": "error", "message": session["last_message"]}
+
+
+@app.post("/api/accounts/qr-login/cancel")
+async def qr_login_cancel(payload: dict):
+    session_id = payload.get("session_id", "")
+    session = QR_SESSIONS.pop(session_id, None)
+    if session:
+        session["status"] = "cancelled"
+        await session["client"].aclose()
+    return {"ok": True}
+
+
 @app.post("/api/accounts")
 async def add_account(data: AccountInput):
     try:
