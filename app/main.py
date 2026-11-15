@@ -306,17 +306,15 @@ def _minutes(value: str) -> int:
 def ensure_daily_plan() -> None:
     today = date.today().isoformat()
     with db() as conn:
-        exists = conn.execute("SELECT 1 FROM daily_schedule WHERE schedule_date=? LIMIT 1", (today,)).fetchone()
-        if exists:
-            return
         accounts = conn.execute("SELECT id FROM accounts WHERE enabled=1 ORDER BY id").fetchall()
+        existing = {row["account_id"] for row in conn.execute("SELECT account_id FROM daily_schedule WHERE schedule_date=?", (today,)).fetchall()}
         if not accounts:
             return
         start = _minutes(get_setting("window_start", DEFAULT_START))
         end = _minutes(get_setting("window_end", DEFAULT_END))
         if end <= start:
             return
-        ids = [row["id"] for row in accounts]
+        ids = [row["id"] for row in accounts if row["id"] not in existing]
         random.shuffle(ids)
         gaps = [random.randint(3, 15) for _ in range(max(0, len(ids) - 1))]
         available = (end - start) * 60
@@ -343,6 +341,7 @@ async def process_due_signs() -> None:
     ensure_daily_plan()
     now = datetime.now().astimezone()
     with db() as conn:
+        conn.execute("UPDATE daily_schedule SET status='pending' WHERE schedule_date=? AND status='running'", (date.today().isoformat(),))
         due = conn.execute(
             "SELECT * FROM daily_schedule WHERE schedule_date=? AND status='pending' AND scheduled_at<=? ORDER BY scheduled_at",
             (date.today().isoformat(), now.isoformat(timespec="seconds")),
@@ -354,7 +353,7 @@ async def process_due_signs() -> None:
         with db() as conn:
             item = conn.execute("SELECT * FROM daily_schedule WHERE id=?", (schedule_id,)).fetchone()
         result = await sign_account(item["account_id"])
-        if result and result.status in ("error", "cookie_invalid") and item["attempts"] + 1 < 3:
+        if result and result.status in ("error", "cookie_invalid") and item["attempts"] < 3:
             from datetime import timedelta
             retry_at = datetime.now().astimezone() + timedelta(minutes=random.randint(10, 20))
             with db() as conn:
